@@ -1,56 +1,77 @@
 import { TokenTheme } from "@supernovaio/sdk-exporters"
 import { getLogger } from "..";
 
-export class XcodeTheme {
-    name: string;
-    lightTheme?: TokenTheme;
-    darkTheme?: TokenTheme;
-
-    constructor(name: string, lightTheme?: TokenTheme, darkTheme?: TokenTheme) {
-        this.name = name;
-        this.lightTheme = lightTheme;
-        this.darkTheme = darkTheme;
-    }
+export interface XcodeTheme {
+  readonly name: string;
+  readonly lightTheme?: TokenTheme;
+  readonly darkTheme?: TokenTheme;
 }
 
+type ThemeVariant = "light" | "dark";
 
-function isLightThemeName(name: string): boolean {
-  return /\slight\s*$/.test(name.toLowerCase());
+function getThemeVariant(name: string): ThemeVariant | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (/\blight\b$/.test(normalized)) {
+    return "light";
+  }
+  if (/\bdark\b$/.test(normalized)) {
+    return "dark";
+  }
+  return undefined;
 }
 
-function isDarkThemeName(name: string): boolean {
-  return /\sdark\s*$/.test(name.toLowerCase());
-}
-
-function baseNameFromTheme(name: string): string {
+function deriveBaseThemeName(name: string, _variant?: ThemeVariant): string {
   const trimmed = name.trim();
-  const firstWord = trimmed.split(/\s+/)[0];
-  const logger = getLogger();
-  logger.log(`Base name from theme "${name}" is "${firstWord}"`);
-  return firstWord;
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  const [base] = trimmed.split(/\s+/);
+  return base ?? trimmed;
+}
+
+
+type ThemeVariantMap = Partial<Record<ThemeVariant, TokenTheme>>;
+
+function createThemeGroup(name: string, variants: ThemeVariantMap): XcodeTheme {
+  return {
+    name,
+    lightTheme: variants.light,
+    darkTheme: variants.dark,
+  };
 }
 
 export function groupThemes(themes: Array<TokenTheme>): Array<XcodeTheme> {
-    const logger = getLogger();
-    logger.log(`Grouping ${themes.length} themes`);
-    const groups = new Map<string, { light?: TokenTheme; dark?: TokenTheme }>();
-
-  for (const t of themes) {
-    logger.log(`Processing theme: ${t.name}`);
-    const base = baseNameFromTheme(t.name);
-    const entry = groups.get(base) ?? {};
-    if (isLightThemeName(t.name)) entry.light = t;
-    else if (isDarkThemeName(t.name)) entry.dark = t;
-    groups.set(base, entry);
-    logger.log(`Processing theme: ${t.name}, base: ${base}, light: ${entry.light ? 'yes' : 'no'}, dark: ${entry.dark ? 'yes' : 'no'}`);
+  if (themes.length === 0) {
+    return [];
   }
 
-    const result: Array<XcodeTheme> = [];
-    for (const [base, pair] of groups) {
-        logger.log(`Grouping theme base: ${base}, light: ${pair.light ? 'yes' : 'no'}, dark: ${pair.dark ? 'yes' : 'no'}`);
-      if (pair.light || pair.dark) {
-        result.push(new XcodeTheme(base, pair.light, pair.dark));
-      }
+  const logger = getLogger();
+  const groups = new Map<string, ThemeVariantMap>();
+
+  for (const t of themes) {
+    const variant = getThemeVariant(t.name);
+    if (!variant) {
+      logger.log(`Skipping theme '${t.name}' because no light/dark suffix was detected.`);
+      continue;
     }
+
+    const base = deriveBaseThemeName(t.name, variant);
+    const entry = groups.get(base) ?? {};
+
+    if (entry[variant]) {
+      logger.log(`Duplicate ${variant} theme found for base '${base}'. Replacing existing theme.`);
+    }
+
+    entry[variant] = t;
+    groups.set(base, entry);
+  }
+
+  const result: Array<XcodeTheme> = [];
+  for (const [base, pair] of groups) {
+    if (pair.light || pair.dark) {
+      result.push(createThemeGroup(base, pair));
+    }
+  }
   return result;
 }

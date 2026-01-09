@@ -2,7 +2,7 @@ import { Supernova, PulsarContext, TokenGroup, RemoteVersionIdentifier, AnyOutpu
 import { ThemeHelper, StringCase, TokenNameTracker, WriteTokenPropStore, NamingHelper, FileHelper } from "@supernovaio/export-utils"
 import { createCatalogRootFile, createPerTokenFile } from "./files/color-sets"
 import { ExporterConfiguration } from "../config"
-import { groupThemes } from "./files/xcode-theme"
+import { groupThemes, XcodeTheme } from "./files/xcode-theme"
 
 /**
  * Xcode Color Set Exporter (Proof of Concept)
@@ -61,7 +61,7 @@ export function getLogger(rootPath: string = ""): Logger {
 Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyOutputFile>> => {
   // Prepare output files and, depending on configuration, prepare root path/file
   const files: Array<AnyOutputFile> = []
-  const rootPath = exportConfiguration.generateRootCatalog ? (exportConfiguration.rootCatalogPath || "Colors.xcassets") : ""
+  const rootPath = resolveRootPath()
 
   // Initialize global logger (creates log.txt once)
   const logger = getLogger(rootPath)
@@ -82,9 +82,7 @@ Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyO
   const filter = {brandId: context.brandId ?? undefined};
 
   // Fetch tokens, token groups, and token collections from the selected design system version
-  let tokens = await sdk.tokens.getTokens(remoteVersionIdentifier, filter)
-  let tokenGroups = await sdk.tokens.getTokenGroups(remoteVersionIdentifier, filter)
-  let tokenCollections = await sdk.tokens.getTokenCollections(remoteVersionIdentifier)
+  const { tokens, tokenGroups, tokenCollections } = await loadTokenData(sdk, remoteVersionIdentifier, filter)
   logger.log(`Fetched tokens: ${tokens.length}`)
   logger.log(`Fetched token groups: ${tokenGroups.length}`)
   logger.log(`token groups: ${tokenGroups.slice(0,5).map(g => g.name).join(', ')}${tokenGroups.length > 5 ? ', ...' : ''}`);
@@ -113,34 +111,7 @@ Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyO
   }
 
   // Filter out tokens from excluded collections
-  if (exportConfiguration.excludeCollectionsInPipelines && 
-      exportConfiguration.excludedCollections.length > 0) {
-    
-    const originalCount = colorTokens.length
-    
-    // Create a set of excluded collection names (lowercase) for efficient lookup
-    const excludedCollectionNames = new Set(
-      exportConfiguration.excludedCollections.map(name => name.toLowerCase().trim())
-    )
-    
-    // Filter tokens based on their collectionId
-    colorTokens = colorTokens.filter((token) => {
-      // Find the collection this token belongs to
-      const tokenCollection = tokenCollections.find(c => c.persistentId === token.collectionId)
-      
-      // Exclude if the collection name matches any excluded collection (case-insensitive)
-      if (tokenCollection && excludedCollectionNames.has(tokenCollection.name.toLowerCase().trim())) {
-        return false // Exclude this token
-      }
-      
-      return true // Keep this token
-    })
-    logger.log(`Excluded collections enabled: yes`)
-    logger.log(`Excluded collections: ${exportConfiguration.excludedCollections.join(', ')}`)
-    logger.log(`Color tokens after exclusions: ${colorTokens.length} (was ${originalCount})`)
-  } else {
-    logger.log(`Excluded collections enabled: no`)
-  }
+  colorTokens = filterExcludedCollections(colorTokens, tokenCollections, logger)
 
   if (exportConfiguration.generateRootCatalog) {
     files.push(createCatalogRootFile(rootPath))
@@ -149,32 +120,25 @@ Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyO
     logger.log(`Root catalog generation disabled`)
   }
 
-  const groupedThemes = groupThemes(themesToApply);
-  logger.log(`Grouped themes: (${groupedThemes.length}) ${groupedThemes}`);
-  groupedThemes.forEach(async t => {
-    logger.log(`Grouped theme: ${t.name}, light: ${t.lightTheme ? 'yes' : 'no'}, dark: ${t.darkTheme ? 'yes' : 'no'}`);
+  const groupedThemes = groupThemes(themesToApply)
+  logGroupedThemes(logger, groupedThemes)
 
-    logger.log('Root path for theme: ' + rootPath);
-    const themeName = NamingHelper.codeSafeVariableName(t.name, StringCase.pascalCase);
-    const file = createNameSpaceFolder(themeName, rootPath);
-    files.push(file);
-    logger.log('Created namespace folder for theme: ' + file.path + '/' + file.name);
-    
-    if (t.lightTheme) {
+  const exportContext: ExportContext = {
+    sdk,
+    pulsarContext: context,
+    remoteVersionIdentifier,
+    logger,
+    rootPath,
+    exportConfiguration,
+    tokens,
+    tokenGroups,
+    colorTokens,
+  }
 
-      const path = rootPath ? `${rootPath}/${themeName}` : `${themeName}`;
-      logger.log(`colors path: ${path}`);
-      
-      const createdFiles = await createThemeColors(
-        sdk, context, remoteVersionIdentifier,
-        path,
-        tokens, tokenGroups, exportConfiguration, 
-        colorTokens,
-        t.lightTheme, t.darkTheme
-    );
-      files.push(...createdFiles);
-    }
-  });
+  for (const themeGroup of groupedThemes) {
+    const namespaceFiles = await exportThemeGroup(exportContext, themeGroup)
+    files.push(...namespaceFiles)
+  }
 
   // Return all files to the export engine for writing to the destination
   return files
@@ -182,33 +146,24 @@ Pulsar.export(async (sdk: Supernova, context: PulsarContext): Promise<Array<AnyO
 
 
 async function createThemeColors(
-  sdk: Supernova,
-  context: PulsarContext,
-  remoteVersionIdentifier: RemoteVersionIdentifier,
-  rootPath: string,
-  tokens: Array<Token>,
-  tokenGroups: Array<TokenGroup>,
-  exportConfiguration: ExporterConfiguration,
-  colorTokens: Array<Token>,
+  runtime: ExportContext,
+  colorsPath: string,
   lightTheme: TokenTheme,
   darkTheme?: TokenTheme,
 ): Promise<Array<AnyOutputFile>> {
-  const logger = getLogger();
+  const { sdk, tokens, tokenGroups, exportConfiguration, colorTokens, remoteVersionIdentifier, pulsarContext, logger } = runtime
 
   const created: Array<AnyOutputFile> = []
-    
-  
+
   // Theme application strategy
   // - 0 themes: base only
   // - 1 theme: base + dark (apply that one theme)
   // - 2+ themes: base is computed by applying the FIRST theme; dark is computed by applying the SECOND theme
-  let baseTokens: Array<Token> = tokens
-  let darkTokens: Array<Token> = []
+  const baseTokens = computeTokensForTheme(sdk, tokens, lightTheme)
+  const darkTokens = computeTokensForTheme(sdk, tokens, darkTheme)
 
-  baseTokens = lightTheme ? sdk.tokens.computeTokensByApplyingThemes(tokens, tokens, [lightTheme]) : []
-  darkTokens = darkTheme ? sdk.tokens.computeTokensByApplyingThemes(tokens, tokens, [darkTheme]) : []
-  logger.log(`Applied base theme: ${ThemeHelper.getThemeName(lightTheme!)}`)
-  logger.log(`Applied dark theme: ${ darkTheme ? ThemeHelper.getThemeName(darkTheme) : 'none' }`)
+  logger.log(`Applied base theme: ${ThemeHelper.getThemeName(lightTheme)}`)
+  logger.log(`Applied dark theme: ${darkTheme ? ThemeHelper.getThemeName(darkTheme) : 'none'}`)
 
   // Create lookup maps by token id for base and dark values
   const baseById = new Map<string, Token>(baseTokens.map((t) => [t.id, t]))
@@ -223,7 +178,7 @@ async function createThemeColors(
     const baseToken = baseById.get(token.id) || token
     const darkVariant = darkById.get(token.id)
     const variants = darkVariant ? [darkVariant] : []
-    const file = createPerTokenFile(baseToken, tokenGroups, rootPath, variants, tracker, nameStyle)
+    const file = createPerTokenFile(baseToken, tokenGroups, colorsPath, variants, tracker, nameStyle)
     if (file) {
       created.push(file)
     }
@@ -231,7 +186,7 @@ async function createThemeColors(
   logger.log(`Emitted color set files: ${colorTokens.length}`)
 
   // Optional write-back of folder names to tokens as a custom property
-  if (exportConfiguration.writeNameToProperty && !(context as any).isPreview) {
+  if (exportConfiguration.writeNameToProperty && !(pulsarContext as any).isPreview) {
     const writeStore = new WriteTokenPropStore(sdk, remoteVersionIdentifier)
     await writeStore.writeTokenProperties(exportConfiguration.propertyToWriteNameTo, colorTokens, (t) => {
       // Use tracker+style to mirror exported folder names
@@ -261,4 +216,118 @@ function createNameSpaceFolder(name: string, rootPath: string) {
     fileName: "Contents.json",
     content
   })
+}
+
+function resolveRootPath(): string {
+  if (!exportConfiguration.generateRootCatalog) {
+    return ""
+  }
+  return exportConfiguration.rootCatalogPath || "Colors.xcassets"
+}
+
+async function loadTokenData(
+  sdk: Supernova,
+  remoteVersionIdentifier: RemoteVersionIdentifier,
+  filter: { brandId?: string }
+) {
+  const [tokens, tokenGroups, tokenCollections] = await Promise.all([
+    sdk.tokens.getTokens(remoteVersionIdentifier, filter),
+    sdk.tokens.getTokenGroups(remoteVersionIdentifier, filter),
+    sdk.tokens.getTokenCollections(remoteVersionIdentifier),
+  ])
+
+  return { tokens, tokenGroups, tokenCollections }
+}
+
+function filterExcludedCollections(
+  colorTokens: Array<Token>,
+  tokenCollections: Array<{ persistentId: string; name: string }>,
+  logger: Logger
+): Array<Token> {
+  if (!exportConfiguration.excludeCollectionsInPipelines || exportConfiguration.excludedCollections.length === 0) {
+    logger.log(`Excluded collections enabled: no`)
+    return colorTokens
+  }
+
+  const originalCount = colorTokens.length
+  const excludedCollectionNames = new Set(
+    exportConfiguration.excludedCollections.map((name) => name.toLowerCase().trim())
+  )
+
+  const filtered = colorTokens.filter((token) => {
+    const tokenCollection = tokenCollections.find((c) => c.persistentId === token.collectionId)
+    if (!tokenCollection) {
+      return true
+    }
+    return !excludedCollectionNames.has(tokenCollection.name.toLowerCase().trim())
+  })
+
+  logger.log(`Excluded collections enabled: yes`)
+  logger.log(`Excluded collections: ${exportConfiguration.excludedCollections.join(', ')}`)
+  logger.log(`Color tokens after exclusions: ${filtered.length} (was ${originalCount})`)
+
+  return filtered
+}
+
+function logGroupedThemes(logger: Logger, groupedThemes: Array<XcodeTheme>) {
+  if (groupedThemes.length === 0) {
+    logger.log(`Grouped themes: none`)
+    return
+  }
+
+  const items = groupedThemes
+    .map((group) => {
+      const light = group.lightTheme ? ThemeHelper.getThemeName(group.lightTheme) : '-'
+      const dark = group.darkTheme ? ThemeHelper.getThemeName(group.darkTheme) : '-'
+      return `${group.name} (light: ${light}, dark: ${dark})`
+    })
+    .join('; ')
+
+  logger.log(`Grouped themes (${groupedThemes.length}): ${items}`)
+}
+
+async function exportThemeGroup(runtime: ExportContext, group: XcodeTheme): Promise<Array<AnyOutputFile>> {
+  const { logger, rootPath } = runtime
+
+  logger.log(`Grouped theme: ${group.name}, light: ${group.lightTheme ? 'yes' : 'no'}, dark: ${group.darkTheme ? 'yes' : 'no'}`)
+  logger.log(`Root path for theme: ${rootPath || '-'}`)
+
+  const themeName = NamingHelper.codeSafeVariableName(group.name, StringCase.pascalCase)
+  const namespaceFile = createNameSpaceFolder(themeName, rootPath)
+  logger.log(`Created namespace folder for theme: ${namespaceFile.path}/${namespaceFile.name}`)
+
+  if (!group.lightTheme) {
+    logger.log(`Skipped color generation for ${group.name} because no light theme variant was provided.`)
+    return [namespaceFile]
+  }
+
+  const colorsPath = rootPath ? `${rootPath}/${themeName}` : `${themeName}`
+  logger.log(`Colors path: ${colorsPath}`)
+
+  const createdFiles = await createThemeColors(runtime, colorsPath, group.lightTheme, group.darkTheme)
+
+  return [namespaceFile, ...createdFiles]
+}
+
+function computeTokensForTheme(
+  sdk: Supernova,
+  tokens: Array<Token>,
+  theme?: TokenTheme
+): Array<Token> {
+  if (!theme) {
+    return []
+  }
+  return sdk.tokens.computeTokensByApplyingThemes(tokens, tokens, [theme])
+}
+
+type ExportContext = {
+  sdk: Supernova
+  pulsarContext: PulsarContext
+  remoteVersionIdentifier: RemoteVersionIdentifier
+  logger: Logger
+  rootPath: string
+  exportConfiguration: ExporterConfiguration
+  tokens: Array<Token>
+  tokenGroups: Array<TokenGroup>
+  colorTokens: Array<Token>
 }
